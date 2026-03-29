@@ -1,0 +1,11 @@
+layout {
+    tab name="dev" split_direction="vertical" {
+        pane size=24 borderless=true {
+            plugin location="file:target/wasm32-wasip1/debug/zeldex.wasm" {
+                poll_secs "1.2"
+                status_cmd "target/aarch64-apple-darwin/debug/zeldex-status"
+            }
+        }
+        pane
+    }
+}
