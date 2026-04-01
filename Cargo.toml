@@ -7,16 +7,11 @@ autobins = false
 
 [features]
 default = []
-native = ["dep:anyhow", "dep:tungstenite"]
+native = ["dep:anyhow"]
 
 [[bin]]
 name = "zeldex"
 path = "src/main.rs"
-
-[[bin]]
-name = "zeldex-codex"
-path = "src/bin/zeldex-codex.rs"
-required-features = ["native"]
 
 [[bin]]
 name = "zeldex-status"
@@ -27,7 +22,6 @@ required-features = ["native"]
 ansi_term = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tungstenite = { version = "0.24", optional = true }
 unicode-width = "0.1"
 zellij-tile = "0.44.0"
 zellij-tile-utils = "0.44.0"

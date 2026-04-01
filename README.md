@@ -7,28 +7,21 @@ Current MVP:
 - vertical tabs in a left sidebar
 - click or scroll to switch tabs
 - Codex-only
-- status source is Codex app-server runtime state
-- statuses are `running`, `waiting`, `done`
+- status source is recent Codex transcripts under `~/.codex/sessions`
+- statuses are `idle`, `running`, `waiting`, `done`
 - marks inactive tabs unread when a tracked pane flips into `waiting` or `done`
 
 Dev loop:
 
 ```sh
 nix develop -c cargo build --target wasm32-wasip1 --bin zeldex
-nix develop -c cargo build --target aarch64-apple-darwin --features native --bin zeldex-codex --bin zeldex-status
-nix develop -c cargo test
+nix develop -c cargo build --target aarch64-apple-darwin --features native --bin zeldex-status
+nix develop -c cargo test --features native
 ```
 
 Usage:
 
-1. Start tracked Codex panes with `zeldex-codex` instead of `codex`:
-
-```sh
-target/aarch64-apple-darwin/debug/zeldex-codex
-target/aarch64-apple-darwin/debug/zeldex-codex resume
-```
-
-2. Load the plugin:
+1. Load the plugin:
 
 ```kdl
 pane size=24 borderless=true {
@@ -42,6 +35,8 @@ pane size=24 borderless=true {
 Notes:
 
 - built against Zellij `0.44.0`
-- `zeldex-codex` starts a per-process `codex app-server` on loopback and launches `codex --remote`
 - plugin gets pane pid via Zellij plugin API, then runs one-shot `zeldex-status` refreshes on its timer
-- `zeldex-status` maps pane pid -> wrapper runtime file, then queries the relevant app-server over websocket
+- `zeldex-status` only tracks panes with a live Codex descendant process or a cached Codex binding from earlier polls
+- live Codex panes prefer exact transcript files discovered from descendant processes; cwd matching is only a fallback after a pane is known to be Codex-backed
+- `waiting` is heuristic: last meaningful transcript entry was a tool call and the file has been quiet for at least 3s
+- thread metadata is cached on disk, so long-lived `waiting` / `done` panes keep their status without rescanning full history every poll

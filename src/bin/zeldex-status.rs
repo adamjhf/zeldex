@@ -1,48 +1,19 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, Write};
 
 use anyhow::{anyhow, Result};
-use zeldex::native::{now_unix_seconds, read_runtime, AppServerClient, LiveThreadStatus};
-use zeldex::status::AgentStatusKind;
-use zeldex::status_file::{PaneStatusEntry, StatusSnapshot};
+use zeldex::codex::{collect_status_snapshot, PaneTarget};
 
 fn main() -> Result<()> {
     let panes = parse_panes(env::args().skip(1))?;
-    let updated_at = now_unix_seconds();
-    let mut snapshot = StatusSnapshot {
-        panes: BTreeMap::new(),
-        updated_at,
-    };
-
-    for pane in panes {
-        let Ok(runtime) = read_runtime(pane.pid) else {
-            continue;
-        };
-        let Ok(mut client) = AppServerClient::connect_to(&runtime.ws_url) else {
-            continue;
-        };
-        let Ok(live) = client.live_thread_status() else {
-            continue;
-        };
-        let live = live.unwrap_or(LiveThreadStatus {
-            thread_id: None,
-            thread_name: None,
-            status: AgentStatusKind::Running,
-            updated_at,
-        });
-        snapshot.panes.insert(
-            pane.id.clone(),
-            PaneStatusEntry {
-                pane_id: pane.id,
-                pid: pane.pid,
-                status: live.status,
-                updated_at: live.updated_at,
-                thread_id: live.thread_id,
-                thread_name: live.thread_name,
-            },
-        );
-    }
+    let pane_targets = panes
+        .into_iter()
+        .map(|pane| PaneTarget {
+            pane_id: pane.id,
+            pid: pane.pid,
+        })
+        .collect::<Vec<_>>();
+    let snapshot = collect_status_snapshot(&pane_targets)?;
 
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, &snapshot)?;
