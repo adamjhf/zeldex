@@ -14,7 +14,6 @@ pub struct StatusSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaneStatusEntry {
     pub pane_id: String,
-    pub pid: u32,
     pub status: AgentStatusKind,
     pub updated_at: u64,
     #[serde(default)]

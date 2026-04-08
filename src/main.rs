@@ -1,11 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::time::SystemTime;
+use zeldex::codex::{collect_status_snapshot, parse_refresh_output, PaneTarget, RefreshCache};
 use zeldex::render::{render_sidebar, TabLine};
 use zeldex::status::AgentStatusKind;
 use zeldex::status_file::StatusSnapshot;
 use zellij_tile::prelude::*;
 
 const DEFAULT_POLL_SECS: f64 = 1.2;
-const DEFAULT_STATUS_CMD: &str = "zeldex-status";
+const STATUS_REFRESH_SCRIPT: &str = r#"code_home="${CODEX_HOME:-$HOME/.codex}"
+index="$code_home/session_index.jsonl"
+if [ -f "$index" ]; then
+  printf '\036index\t0\t%s\n' "$index"
+  cat "$index"
+  printf '\n'
+fi
+sessions="$code_home/sessions"
+if [ -d "$sessions" ]; then
+  find "$sessions" -type f -name '*.jsonl' -mtime -3 | sort | while IFS= read -r path; do
+    modified_at="$(stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || printf '0')"
+    printf '\036transcript\t%s\t%s\n' "$modified_at" "$path"
+    cat "$path"
+    printf '\n'
+  done
+fi"#;
 
 #[derive(Clone, Debug)]
 struct TrackedPane {
@@ -22,8 +40,9 @@ struct State {
     clickable_rows: Vec<Option<usize>>,
     mode_info: ModeInfo,
     poll_secs: f64,
-    status_cmd: String,
     snapshot: StatusSnapshot,
+    refresh_cache: RefreshCache,
+    refresh_targets: Vec<PaneTarget>,
     refresh_nonce: u64,
     refresh_in_flight: bool,
     permissions_granted: bool,
@@ -54,10 +73,6 @@ impl ZellijPlugin for State {
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| *value > 0.0)
             .unwrap_or(DEFAULT_POLL_SECS);
-        self.status_cmd = configuration
-            .get("status_cmd")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_STATUS_CMD.to_owned());
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -190,22 +205,22 @@ impl State {
         if !self.permissions_granted || self.refresh_in_flight {
             return;
         }
-
-        let mut args = vec![self.status_cmd.clone()];
-        for (pane_id, pid) in self.visible_pane_pids() {
-            args.push("--pane".to_owned());
-            args.push(format!("{pane_id}:{pid}"));
+        let targets = self.visible_pane_targets();
+        if targets.is_empty() {
+            self.refresh_targets.clear();
+            self.refresh_cache.bindings.clear();
+            return;
         }
 
         self.refresh_nonce += 1;
+        self.refresh_targets = targets;
         self.refresh_in_flight = true;
 
         let mut context = BTreeMap::new();
         context.insert("kind".to_owned(), "status-refresh".to_owned());
         context.insert("nonce".to_owned(), self.refresh_nonce.to_string());
 
-        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        run_command(&refs, context);
+        run_command(&["/bin/sh", "-lc", STATUS_REFRESH_SCRIPT], context);
     }
 
     fn handle_status_refresh(
@@ -229,9 +244,17 @@ impl State {
             return false;
         }
 
-        serde_json::from_slice::<StatusSnapshot>(&stdout)
+        parse_refresh_output(&stdout)
             .ok()
-            .map(|snapshot| self.apply_snapshot(snapshot))
+            .map(|files| {
+                let snapshot = collect_status_snapshot(
+                    &self.refresh_targets,
+                    &files,
+                    &mut self.refresh_cache,
+                    SystemTime::now(),
+                );
+                self.apply_snapshot(snapshot)
+            })
             .unwrap_or(false)
     }
 
@@ -262,23 +285,24 @@ impl State {
         self.clear_active_unread();
     }
 
-    fn visible_pane_pids(&self) -> Vec<(u32, u32)> {
-        let mut pane_pids = Vec::new();
+    fn visible_pane_targets(&self) -> Vec<PaneTarget> {
+        let mut pane_targets = Vec::new();
         for panes in self.panes_by_tab.values() {
             for pane in panes {
                 if pane.is_plugin {
                     continue;
                 }
                 let pane_id = PaneId::Terminal(pane.id);
-                let Ok(pid) = get_pane_pid(pane_id) else {
+                let Ok(cwd) = get_pane_cwd(pane_id) else {
                     continue;
                 };
-                if pid > 0 {
-                    pane_pids.push((pane.id, pid as u32));
-                }
+                pane_targets.push(PaneTarget {
+                    pane_id: pane.id.to_string(),
+                    cwd: normalize_cwd(cwd),
+                });
             }
         }
-        pane_pids
+        pane_targets
     }
 
     fn clear_active_unread(&mut self) {
@@ -309,6 +333,20 @@ impl State {
             .max_by_key(|status| status.priority())
             .unwrap_or(AgentStatusKind::Idle)
     }
+}
+
+fn normalize_cwd(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn tracked_pane_set_changed(

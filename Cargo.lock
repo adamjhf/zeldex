@@ -2736,7 +2736,6 @@ name = "zeldex"
 version = "0.1.0"
 dependencies = [
  "ansi_term",
- "anyhow",
  "serde",
  "serde_json",
  "unicode-width",

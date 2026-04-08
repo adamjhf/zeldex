@@ -1,25 +1,46 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::codex_cache::{load_codex_cache, save_codex_cache, CachedPaneBinding, CachedThreadRecord, CodexCache};
 use crate::status::AgentStatusKind;
 use crate::status_file::{PaneStatusEntry, StatusSnapshot};
 
-const BINDING_TTL: Duration = Duration::from_secs(12 * 60 * 60);
-const RECENT_DIR_WINDOW: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 const WAIT_AFTER_TOOL_CALL: Duration = Duration::from_secs(3);
 const THREAD_NAME_MAX: usize = 80;
+const SECTION_MARKER: char = '\u{1e}';
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaneTarget {
     pub pane_id: String,
-    pub pid: u32,
+    pub cwd: PathBuf,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RefreshCache {
+    pub bindings: BTreeMap<String, CachedPaneBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CachedPaneBinding {
+    pub pane_id: String,
+    pub cwd: String,
+    pub transcript_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexFile {
+    pub kind: CodexFileKind,
+    pub modified_at: u64,
+    pub path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexFileKind {
+    Index,
+    Transcript,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,71 +53,64 @@ struct ThreadSummary {
     updated_at: u64,
 }
 
-#[derive(Clone, Debug)]
-struct PaneContext {
-    pane_id: String,
-    pid: u32,
-    cwd: PathBuf,
-    codex_pids: Vec<u32>,
-    binding: Option<CachedPaneBinding>,
+pub fn parse_refresh_output(stdout: &[u8]) -> Result<Vec<CodexFile>, String> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut files = Vec::new();
+    let mut current: Option<CodexFile> = None;
+
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix(SECTION_MARKER) {
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            current = Some(parse_section_header(header)?);
+            continue;
+        }
+
+        if let Some(file) = current.as_mut() {
+            file.content.push_str(line);
+            file.content.push('\n');
+        }
+    }
+
+    if let Some(file) = current {
+        files.push(file);
+    }
+
+    Ok(files)
 }
 
-#[derive(Clone, Debug)]
-struct PaneProbe {
-    pane_id: String,
-    pid: u32,
-    cwd: PathBuf,
-    codex_pids: Vec<u32>,
-    binding: Option<CachedPaneBinding>,
-}
-
-#[derive(Clone, Debug)]
-struct ProcessEntry {
-    ppid: u32,
-    comm: String,
-    args: String,
-}
-
-pub fn collect_status_snapshot(panes: &[PaneTarget]) -> Result<StatusSnapshot> {
-    let now = SystemTime::now();
+pub fn collect_status_snapshot(
+    panes: &[PaneTarget],
+    files: &[CodexFile],
+    cache: &mut RefreshCache,
+    now: SystemTime,
+) -> StatusSnapshot {
     let updated_at = unix_seconds(now);
-    let codex_home = codex_home();
-    let sessions_dir = codex_home.join("sessions");
-    let thread_names = load_thread_index(&codex_home);
-    let mut cache = load_codex_cache();
-    let processes = load_process_snapshot().unwrap_or_default();
-    let pane_probes = panes
+    let thread_names = load_thread_index(files);
+    let threads = files
         .iter()
-        .filter_map(|pane| probe_pane(pane, &processes, &cache))
+        .filter(|file| file.kind == CodexFileKind::Transcript)
+        .filter_map(|file| summarize_thread(file, &thread_names, now))
         .collect::<Vec<_>>();
-    let pane_contexts = pane_probes
+    let threads_by_path = threads
         .iter()
-        .filter_map(build_pane_context)
-        .collect::<Vec<_>>();
+        .cloned()
+        .map(|thread| (thread.transcript_path.clone(), thread))
+        .collect::<HashMap<_, _>>();
 
     let mut snapshot = StatusSnapshot {
         panes: BTreeMap::new(),
         updated_at,
     };
 
-    if pane_contexts.is_empty() {
-        prune_cache(&mut cache, &pane_probes, updated_at);
-        let _ = save_codex_cache(&cache);
-        return Ok(snapshot);
-    }
-
-    refresh_discovered_threads(&mut cache, &sessions_dir, &thread_names, now)?;
-
-    for pane in &pane_contexts {
-        let exact_paths = open_transcript_paths_for_pids(&pane.codex_pids, &sessions_dir).unwrap_or_default();
-        let resolved = resolve_pane_thread(&mut cache, pane, &exact_paths, &thread_names, now)?;
-
+    for pane in panes {
+        let resolved = resolve_pane_thread(pane, &threads, &threads_by_path, cache);
         if let Some(thread) = resolved {
             snapshot.panes.insert(
                 pane.pane_id.clone(),
                 PaneStatusEntry {
                     pane_id: pane.pane_id.clone(),
-                    pid: pane.pid,
                     status: thread.status,
                     updated_at: thread.updated_at,
                     thread_id: Some(thread.thread_id.clone()),
@@ -107,10 +121,8 @@ pub fn collect_status_snapshot(panes: &[PaneTarget]) -> Result<StatusSnapshot> {
                 pane.pane_id.clone(),
                 CachedPaneBinding {
                     pane_id: pane.pane_id.clone(),
-                    pid: pane.pid,
                     cwd: pane.cwd.to_string_lossy().into_owned(),
                     transcript_path: thread.transcript_path.to_string_lossy().into_owned(),
-                    last_seen_at: updated_at,
                 },
             );
         } else {
@@ -118,476 +130,142 @@ pub fn collect_status_snapshot(panes: &[PaneTarget]) -> Result<StatusSnapshot> {
         }
     }
 
-    prune_cache(&mut cache, &pane_probes, updated_at);
-    let _ = save_codex_cache(&cache);
-    Ok(snapshot)
+    prune_bindings(cache, panes, &threads_by_path);
+    snapshot
 }
 
-fn probe_pane(
-    pane: &PaneTarget,
-    processes: &HashMap<u32, ProcessEntry>,
-    cache: &CodexCache,
-) -> Option<PaneProbe> {
-    let cwd = cwd_for_pid(pane.pid).ok()?;
-    let binding = cache
-        .bindings
-        .get(&pane.pane_id)
-        .cloned()
-        .filter(|binding| binding.pid == pane.pid);
-    let codex_pids = codex_descendant_pids(processes, pane.pid);
+fn parse_section_header(header: &str) -> Result<CodexFile, String> {
+    let mut parts = header.splitn(3, '\t');
+    let kind = match parts.next() {
+        Some("index") => CodexFileKind::Index,
+        Some("transcript") => CodexFileKind::Transcript,
+        Some(other) => return Err(format!("unknown codex file kind: {other}")),
+        None => return Err("missing codex file kind".to_owned()),
+    };
+    let modified_at = parts
+        .next()
+        .ok_or_else(|| "missing modified_at".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "invalid modified_at".to_owned())?;
+    let path = parts
+        .next()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "missing codex file path".to_owned())?;
 
-    Some(PaneProbe {
-        pane_id: pane.pane_id.clone(),
-        pid: pane.pid,
-        cwd,
-        codex_pids,
-        binding,
+    Ok(CodexFile {
+        kind,
+        modified_at,
+        path: normalize_path(&path),
+        content: String::new(),
     })
 }
 
-fn build_pane_context(pane: &PaneProbe) -> Option<PaneContext> {
-    let binding = pane.binding.clone().filter(|binding| binding_matches_pane(binding, pane));
-    if pane.codex_pids.is_empty() && binding.is_none() {
-        return None;
-    }
+fn load_thread_index(files: &[CodexFile]) -> HashMap<String, String> {
+    let mut names = HashMap::new();
 
-    Some(PaneContext {
-        pane_id: pane.pane_id.clone(),
-        pid: pane.pid,
-        cwd: pane.cwd.clone(),
-        codex_pids: pane.codex_pids.clone(),
-        binding,
-    })
-}
-
-fn resolve_pane_thread(
-    cache: &mut CodexCache,
-    pane: &PaneContext,
-    exact_paths: &[PathBuf],
-    thread_names: &HashMap<String, String>,
-    now: SystemTime,
-) -> Result<Option<ThreadSummary>> {
-    let mut candidates = Vec::new();
-    let mut seen_paths = HashSet::new();
-
-    for path in exact_paths {
-        let normalized = normalize_path(path);
-        if seen_paths.insert(normalized.clone()) {
-            if let Some(thread) = refresh_thread(cache, &normalized, thread_names, now)? {
-                candidates.push(thread);
-            }
-        }
-    }
-
-    if let Some(binding) = &pane.binding {
-        let path = normalize_path(Path::new(&binding.transcript_path));
-        if seen_paths.insert(path.clone()) {
-            if let Some(thread) = refresh_thread(cache, &path, thread_names, now)? {
-                candidates.push(thread);
-            }
-        }
-    }
-
-    if let Some(best_exact) = candidates
-        .into_iter()
-        .max_by_key(|thread| (thread.updated_at, thread.status.priority()))
-    {
-        return Ok(Some(best_exact));
-    }
-
-    if pane.codex_pids.is_empty() && pane.binding.is_none() {
-        return Ok(None);
-    }
-
-    Ok(select_best_cached_thread(cache, &pane.cwd))
-}
-
-fn prune_cache(cache: &mut CodexCache, panes: &[PaneProbe], now: u64) {
-    let visible = panes
+    for file in files
         .iter()
-        .map(|pane| (pane.pane_id.as_str(), pane))
-        .collect::<HashMap<_, _>>();
-    cache.bindings.retain(|pane_id, binding| {
-        if let Some(pane) = visible.get(pane_id.as_str()) {
-            return binding_matches_pane(binding, pane);
-        }
-        now.saturating_sub(binding.last_seen_at) <= BINDING_TTL.as_secs()
-    });
-}
-
-fn binding_matches_pane(binding: &CachedPaneBinding, pane: &PaneProbe) -> bool {
-    binding.pid == pane.pid && normalize_path(Path::new(&binding.cwd)) == pane.cwd
-}
-
-fn refresh_discovered_threads(
-    cache: &mut CodexCache,
-    sessions_dir: &Path,
-    thread_names: &HashMap<String, String>,
-    now: SystemTime,
-) -> Result<()> {
-    let files = if cache.threads.is_empty() {
-        collect_all_session_files(sessions_dir)?
-    } else {
-        collect_recent_session_files(sessions_dir, now)?
-    };
-
-    for path in files {
-        let _ = refresh_thread(cache, &path, thread_names, now)?;
-    }
-    Ok(())
-}
-
-fn refresh_thread(
-    cache: &mut CodexCache,
-    path: &Path,
-    thread_names: &HashMap<String, String>,
-    now: SystemTime,
-) -> Result<Option<ThreadSummary>> {
-    let normalized = normalize_path(path);
-    let key = normalized.to_string_lossy().into_owned();
-    let metadata = match fs::metadata(&normalized) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            cache.threads.remove(&key);
-            return Ok(None);
-        }
-    };
-
-    let modified_at = unix_seconds(metadata.modified().unwrap_or(UNIX_EPOCH));
-    let file_size = metadata.len();
-
-    if let Some(record) = cache.threads.get_mut(&key) {
-        if record.file_size == file_size && record.modified_at == modified_at {
-            if let Some(name) = thread_names.get(&record.thread_id) {
-                record.thread_name = Some(name.clone());
-            }
-            return Ok(Some(thread_from_record(record)));
-        }
-    }
-
-    let summary = summarize_thread(&normalized, thread_names, now)?;
-    match summary {
-        Some(summary) => {
-            cache.threads.insert(key, record_from_thread(&summary, file_size, modified_at));
-            Ok(Some(summary))
-        }
-        None => {
-            cache.threads.remove(&normalized.to_string_lossy().into_owned());
-            Ok(None)
-        }
-    }
-}
-
-fn collect_all_session_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_session_files_recursive(dir, &mut files)?;
-    Ok(files)
-}
-
-fn collect_session_files_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_session_files_recursive(&path, out)?;
-            continue;
-        }
-        if file_type.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            out.push(normalize_path(&path));
-        }
-    }
-
-    Ok(())
-}
-
-fn collect_recent_session_files(dir: &Path, now: SystemTime) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_recent_day_files(dir, 0, now, &mut files)?;
-    Ok(files)
-}
-
-fn collect_recent_day_files(dir: &Path, depth: usize, now: SystemTime, out: &mut Vec<PathBuf>) -> Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-
-        if depth == 2 {
-            let modified = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
-            if now.duration_since(modified).unwrap_or_default() > RECENT_DIR_WINDOW {
-                continue;
-            }
-            let Ok(day_entries) = fs::read_dir(&path) else {
+        .filter(|file| file.kind == CodexFileKind::Index)
+    {
+        for line in file.content.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            for day_entry in day_entries {
-                let day_entry = day_entry?;
-                let day_path = day_entry.path();
-                let Ok(day_type) = day_entry.file_type() else {
-                    continue;
-                };
-                if day_type.is_file()
-                    && day_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
-                {
-                    out.push(normalize_path(&day_path));
-                }
-            }
-            continue;
+            let Some(id) = value.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(name) = value.get("thread_name").and_then(Value::as_str) else {
+                continue;
+            };
+            names.insert(id.to_owned(), name.to_owned());
         }
-
-        collect_recent_day_files(&path, depth + 1, now, out)?;
-    }
-
-    Ok(())
-}
-
-fn codex_descendant_pids(processes: &HashMap<u32, ProcessEntry>, root_pid: u32) -> Vec<u32> {
-    let mut stack = vec![root_pid];
-    let mut descendants = Vec::new();
-
-    while let Some(pid) = stack.pop() {
-        descendants.push(pid);
-        for (child_pid, process) in processes {
-            if process.ppid == pid {
-                stack.push(*child_pid);
-            }
-        }
-    }
-
-    descendants
-        .into_iter()
-        .filter(|pid| processes.get(pid).map(is_codex_process).unwrap_or(false))
-        .collect()
-}
-
-fn load_process_snapshot() -> Result<HashMap<u32, ProcessEntry>> {
-    let output = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,comm=,args="])
-        .output()
-        .context("run ps for process snapshot")?;
-    if !output.status.success() {
-        anyhow::bail!("ps failed");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut processes = HashMap::new();
-
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace();
-        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
-            continue;
-        };
-        let Some(comm) = parts.next() else {
-            continue;
-        };
-        let args = trimmed
-            .splitn(4, char::is_whitespace)
-            .nth(3)
-            .unwrap_or(comm)
-            .to_owned();
-        processes.insert(
-            pid,
-            ProcessEntry {
-                ppid,
-                comm: comm.to_owned(),
-                args,
-            },
-        );
-    }
-
-    Ok(processes)
-}
-
-fn is_codex_process(process: &ProcessEntry) -> bool {
-    let comm = Path::new(&process.comm)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(process.comm.as_str());
-    if comm == "codex" {
-        return true;
-    }
-
-    process
-        .args
-        .split_whitespace()
-        .next()
-        .map(|value| {
-            Path::new(value)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name == "codex")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-}
-
-fn open_transcript_paths_for_pids(pids: &[u32], sessions_dir: &Path) -> Result<Vec<PathBuf>> {
-    if pids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut args = vec!["-Fn".to_owned()];
-    for pid in pids {
-        args.push("-p".to_owned());
-        args.push(pid.to_string());
-    }
-
-    let output = Command::new("lsof")
-        .args(args.iter().map(String::as_str))
-        .output()
-        .context("run lsof for codex descendants")?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths = Vec::new();
-    for line in stdout.lines() {
-        let Some(path) = line.strip_prefix('n') else {
-            continue;
-        };
-        if !path.ends_with(".jsonl") {
-            continue;
-        }
-        let candidate = normalize_path(Path::new(path));
-        if candidate.starts_with(sessions_dir) {
-            paths.push(candidate);
-        }
-    }
-    Ok(paths)
-}
-
-fn select_best_cached_thread(cache: &CodexCache, pane_cwd: &Path) -> Option<ThreadSummary> {
-    let pane_cwd = normalize_path(pane_cwd);
-    cache.threads
-        .values()
-        .filter_map(|record| {
-            let thread = thread_from_record(record);
-            match_score(&pane_cwd, &thread.project_dir).map(|score| {
-                (
-                    score,
-                    depth(&thread.project_dir),
-                    thread.updated_at,
-                    thread,
-                )
-            })
-        })
-        .max_by_key(|(score, depth, updated_at, _)| (*score, *depth, *updated_at))
-        .map(|(_, _, _, thread)| thread)
-}
-
-fn thread_from_record(record: &CachedThreadRecord) -> ThreadSummary {
-    ThreadSummary {
-        transcript_path: normalize_path(Path::new(&record.transcript_path)),
-        thread_id: record.thread_id.clone(),
-        thread_name: record.thread_name.clone(),
-        project_dir: normalize_path(Path::new(&record.project_dir)),
-        status: record.status,
-        updated_at: record.updated_at,
-    }
-}
-
-fn record_from_thread(summary: &ThreadSummary, file_size: u64, modified_at: u64) -> CachedThreadRecord {
-    CachedThreadRecord {
-        transcript_path: summary.transcript_path.to_string_lossy().into_owned(),
-        file_size,
-        modified_at,
-        thread_id: summary.thread_id.clone(),
-        thread_name: summary.thread_name.clone(),
-        project_dir: summary.project_dir.to_string_lossy().into_owned(),
-        status: summary.status,
-        updated_at: summary.updated_at,
-    }
-}
-
-fn codex_home() -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
-}
-
-fn cwd_for_pid(pid: u32) -> Result<PathBuf> {
-    let output = Command::new("lsof")
-        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
-        .output()
-        .with_context(|| format!("run lsof for pid {pid}"))?;
-    if !output.status.success() {
-        anyhow::bail!("lsof failed for pid {pid}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let path = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix('n'))
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
-        .context("missing cwd from lsof output")?;
-    Ok(normalize_path(&path))
-}
-
-fn load_thread_index(codex_home: &Path) -> HashMap<String, String> {
-    let path = codex_home.join("session_index.jsonl");
-    let Ok(text) = fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-
-    let mut names = HashMap::new();
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(name) = value.get("thread_name").and_then(Value::as_str) else {
-            continue;
-        };
-        names.insert(id.to_owned(), name.to_owned());
     }
 
     names
 }
 
+fn resolve_pane_thread(
+    pane: &PaneTarget,
+    threads: &[ThreadSummary],
+    threads_by_path: &HashMap<PathBuf, ThreadSummary>,
+    cache: &RefreshCache,
+) -> Option<ThreadSummary> {
+    let bound = cache
+        .bindings
+        .get(&pane.pane_id)
+        .filter(|binding| normalize_path(Path::new(&binding.cwd)) == pane.cwd)
+        .and_then(|binding| {
+            threads_by_path
+                .get(&normalize_path(Path::new(&binding.transcript_path)))
+                .cloned()
+        });
+    let best = select_best_thread(threads, &pane.cwd);
+
+    match (bound, best) {
+        (Some(bound), Some(best)) if thread_sort_key(&best) > thread_sort_key(&bound) => Some(best),
+        (Some(bound), _) => Some(bound),
+        (None, some_best) => some_best,
+    }
+}
+
+fn prune_bindings(
+    cache: &mut RefreshCache,
+    panes: &[PaneTarget],
+    threads_by_path: &HashMap<PathBuf, ThreadSummary>,
+) {
+    let visible_panes = panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), &pane.cwd))
+        .collect::<HashMap<_, _>>();
+
+    cache.bindings.retain(|pane_id, binding| {
+        let Some(cwd) = visible_panes.get(pane_id.as_str()) else {
+            return false;
+        };
+
+        normalize_path(Path::new(&binding.cwd)) == **cwd
+            && threads_by_path.contains_key(&normalize_path(Path::new(&binding.transcript_path)))
+    });
+}
+
+fn select_best_thread(threads: &[ThreadSummary], pane_cwd: &Path) -> Option<ThreadSummary> {
+    let pane_cwd = normalize_path(pane_cwd);
+
+    threads
+        .iter()
+        .filter_map(|thread| {
+            match_score(&pane_cwd, &thread.project_dir).map(|score| {
+                (
+                    score,
+                    depth(&thread.project_dir),
+                    thread_sort_key(thread),
+                    thread.clone(),
+                )
+            })
+        })
+        .max_by_key(|(score, depth, sort_key, _)| (*score, *depth, *sort_key))
+        .map(|(_, _, _, thread)| thread)
+}
+
+fn thread_sort_key(thread: &ThreadSummary) -> (u64, usize) {
+    (thread.updated_at, thread.status.priority())
+}
+
 fn summarize_thread(
-    path: &Path,
+    file: &CodexFile,
     thread_names: &HashMap<String, String>,
     now: SystemTime,
-) -> Result<Option<ThreadSummary>> {
-    let metadata = fs::metadata(path)?;
-    let modified_at = metadata.modified().unwrap_or(UNIX_EPOCH);
+) -> Option<ThreadSummary> {
+    let modified_at = UNIX_EPOCH + Duration::from_secs(file.modified_at);
     let age = now.duration_since(modified_at).unwrap_or_default();
-    let text = fs::read_to_string(path)?;
-    let thread_id = parse_thread_id(path);
+    let thread_id = parse_thread_id(&file.path);
     let mut status = AgentStatusKind::Idle;
     let mut project_dir = None;
     let mut thread_name = thread_names.get(&thread_id).cloned();
     let mut last_entry_was_tool_call = false;
 
-    for line in text.lines() {
+    for line in file.content.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
@@ -603,28 +281,30 @@ fn summarize_thread(
         }
     }
 
-    let Some(project_dir) = project_dir else {
-        return Ok(None);
-    };
+    let project_dir = project_dir?;
     if status == AgentStatusKind::Idle {
-        return Ok(None);
+        return None;
     }
-    if status == AgentStatusKind::Running && last_entry_was_tool_call && age >= WAIT_AFTER_TOOL_CALL {
+    if status == AgentStatusKind::Running && last_entry_was_tool_call && age >= WAIT_AFTER_TOOL_CALL
+    {
         status = AgentStatusKind::Waiting;
     }
 
-    Ok(Some(ThreadSummary {
-        transcript_path: normalize_path(path),
+    Some(ThreadSummary {
+        transcript_path: file.path.clone(),
         thread_id,
         thread_name,
         project_dir,
         status,
-        updated_at: unix_seconds(modified_at),
-    }))
+        updated_at: file.modified_at,
+    })
 }
 
 fn parse_thread_id(path: &Path) -> String {
-    let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
     stem.rsplit('-')
         .take(5)
         .collect::<Vec<_>>()
@@ -639,7 +319,11 @@ fn extract_project_dir(entry: &Value) -> Option<String> {
     if !matches!(kind, "session_meta" | "turn_context") {
         return None;
     }
-    entry.get("payload")?.get("cwd")?.as_str().map(ToOwned::to_owned)
+    entry
+        .get("payload")?
+        .get("cwd")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn determine_status(entry: &Value) -> Option<AgentStatusKind> {
@@ -694,11 +378,17 @@ fn determine_status(entry: &Value) -> Option<AgentStatusKind> {
 }
 
 fn is_tool_call_entry(entry: &Value) -> bool {
-    if matches!(entry.get("type").and_then(Value::as_str), Some("function_call")) {
+    if matches!(
+        entry.get("type").and_then(Value::as_str),
+        Some("function_call")
+    ) {
         return true;
     }
 
-    if !matches!(entry.get("type").and_then(Value::as_str), Some("response_item")) {
+    if !matches!(
+        entry.get("type").and_then(Value::as_str),
+        Some("response_item")
+    ) {
         return false;
     }
 
@@ -746,7 +436,8 @@ fn extract_thread_name(entry: &Value) -> Option<String> {
         return from_payload;
     }
 
-    entry.get("content")
+    entry
+        .get("content")
         .filter(|_| entry.get("type").and_then(Value::as_str) == Some("message"))
         .filter(|_| entry.get("role").and_then(Value::as_str) == Some("user"))
         .and_then(Value::as_array)
@@ -807,9 +498,8 @@ fn depth(path: &Path) -> usize {
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let source = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut normalized = PathBuf::new();
-    for component in source.components() {
+    for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -822,38 +512,36 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 fn unix_seconds(time: SystemTime) -> u64 {
-    time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
-    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime};
 
     use serde_json::json;
 
-    use crate::codex_cache::{CachedPaneBinding, CachedThreadRecord, CodexCache};
     use crate::status::AgentStatusKind;
 
     use super::{
-        binding_matches_pane, determine_status, extract_thread_name, is_codex_process, is_tool_call_entry,
-        load_thread_index, normalize_path, select_best_cached_thread, summarize_thread, PaneProbe,
-        ProcessEntry, RECENT_DIR_WINDOW, WAIT_AFTER_TOOL_CALL,
+        collect_status_snapshot, determine_status, extract_thread_name, is_tool_call_entry,
+        normalize_path, parse_refresh_output, select_best_thread, summarize_thread,
+        CachedPaneBinding, CodexFile, CodexFileKind, PaneTarget, RefreshCache, ThreadSummary,
+        WAIT_AFTER_TOOL_CALL,
     };
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "zeldex-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&base).unwrap();
-        base
+    #[test]
+    fn parses_refresh_sections() {
+        let files = parse_refresh_output(
+            b"\x1eindex\t0\t/tmp/index.jsonl\n{\"id\":\"a\",\"thread_name\":\"Fix auth\"}\n\x1etranscript\t12\t/tmp/thread.jsonl\n{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/tmp/project\"}}\n",
+        )
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].kind, CodexFileKind::Index);
+        assert_eq!(files[1].modified_at, 12);
     }
 
     #[test]
@@ -879,132 +567,127 @@ mod tests {
     }
 
     #[test]
-    fn prefers_exact_cwd_match_from_cache() {
-        let mut cache = CodexCache::default();
-        cache.threads.insert(
-            "/tmp/project/transcript.jsonl".into(),
-            CachedThreadRecord {
-                transcript_path: "/tmp/project/transcript.jsonl".into(),
-                file_size: 1,
-                modified_at: 1,
-                thread_id: "a".into(),
-                thread_name: None,
-                project_dir: "/tmp/project".into(),
-                status: AgentStatusKind::Running,
-                updated_at: 1,
-            },
-        );
-        cache.threads.insert(
-            "/tmp/transcript.jsonl".into(),
-            CachedThreadRecord {
-                transcript_path: "/tmp/transcript.jsonl".into(),
-                file_size: 1,
-                modified_at: 1,
-                thread_id: "b".into(),
-                thread_name: None,
-                project_dir: "/tmp".into(),
-                status: AgentStatusKind::Done,
-                updated_at: 99,
-            },
-        );
-        let best = select_best_cached_thread(&cache, Path::new("/tmp/project")).unwrap();
-        assert_eq!(best.thread_id, "a");
+    fn prefers_exact_cwd_match() {
+        let threads = vec![
+            thread(
+                "/tmp/project/transcript.jsonl",
+                "/tmp/project",
+                AgentStatusKind::Running,
+                1,
+            ),
+            thread("/tmp/transcript.jsonl", "/tmp", AgentStatusKind::Done, 99),
+        ];
+        let best = select_best_thread(&threads, Path::new("/tmp/project")).unwrap();
+        assert_eq!(best.thread_id, "transcript");
     }
 
     #[test]
     fn waiting_after_tool_call_pause() {
-        let root = temp_dir("waiting");
-        let sessions = root.join("sessions/2026/04/01");
-        fs::create_dir_all(&sessions).unwrap();
-        let transcript = sessions.join("rollout-2026-04-01T10-00-00-019d3333-aaaa-bbbb-cccc-000000000001.jsonl");
-        let mut file = File::create(&transcript).unwrap();
-        writeln!(
-            file,
-            "{}",
-            json!({ "type": "session_meta", "payload": { "cwd": "/tmp/project" } })
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "{}",
-            json!({ "type": "response_item", "payload": { "type": "function_call" } })
-        )
-        .unwrap();
-        let now = SystemTime::now() + WAIT_AFTER_TOOL_CALL + Duration::from_secs(1);
-        let summary = summarize_thread(&transcript, &Default::default(), now)
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.status, AgentStatusKind::Waiting);
-    }
-
-    #[test]
-    fn waiting_after_custom_tool_call_pause() {
-        let root = temp_dir("custom-waiting");
-        let sessions = root.join("sessions/2026/04/01");
-        fs::create_dir_all(&sessions).unwrap();
-        let transcript = sessions.join("rollout-2026-04-01T10-00-00-019d3333-aaaa-bbbb-cccc-000000000111.jsonl");
-        let mut file = File::create(&transcript).unwrap();
-        writeln!(
-            file,
-            "{}",
-            json!({ "type": "session_meta", "payload": { "cwd": "/tmp/project" } })
-        )
-        .unwrap();
-        writeln!(
-            file,
-            "{}",
-            json!({ "type": "response_item", "payload": { "type": "custom_tool_call" } })
-        )
-        .unwrap();
-        let now = SystemTime::now() + WAIT_AFTER_TOOL_CALL + Duration::from_secs(1);
-        let summary = summarize_thread(&transcript, &Default::default(), now)
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.status, AgentStatusKind::Waiting);
-    }
-
-    #[test]
-    fn old_transcript_still_summarized() {
-        let root = temp_dir("old");
-        let sessions = root.join("sessions/2026/03/01");
-        fs::create_dir_all(&sessions).unwrap();
-        let transcript = sessions.join("rollout-2026-03-01T10-00-00-019d3333-aaaa-bbbb-cccc-000000000001.jsonl");
-        fs::write(
-            &transcript,
-            format!(
+        let file = CodexFile {
+            kind: CodexFileKind::Transcript,
+            modified_at: 10,
+            path: PathBuf::from(
+                "/tmp/sessions/2026/04/01/rollout-2026-04-01T10-00-00-019d3333-aaaa-bbbb-cccc-000000000001.jsonl",
+            ),
+            content: format!(
                 "{}\n{}\n",
                 json!({ "type": "session_meta", "payload": { "cwd": "/tmp/project" } }),
-                json!({ "type": "event_msg", "payload": { "type": "task_complete" } })
+                json!({ "type": "response_item", "payload": { "type": "function_call" } })
             ),
-        )
-        .unwrap();
-        let now = SystemTime::now() + RECENT_DIR_WINDOW + Duration::from_secs(60);
-        let summary = summarize_thread(&transcript, &Default::default(), now)
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.status, AgentStatusKind::Done);
-    }
-
-    #[test]
-    fn thread_index_loaded() {
-        let root = temp_dir("index");
-        fs::write(
-            root.join("session_index.jsonl"),
-            "{\"id\":\"abc\",\"thread_name\":\"Fix auth\"}\n",
-        )
-        .unwrap();
-        let names = load_thread_index(&root);
-        assert_eq!(names.get("abc"), Some(&"Fix auth".to_string()));
-    }
-
-    #[test]
-    fn identifies_codex_processes() {
-        let process = ProcessEntry {
-            ppid: 1,
-            comm: "/opt/homebrew/bin/codex".into(),
-            args: "/opt/homebrew/bin/codex exec".into(),
         };
-        assert!(is_codex_process(&process));
+        let now = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(10)
+            + WAIT_AFTER_TOOL_CALL
+            + Duration::from_secs(1);
+        let summary = summarize_thread(&file, &Default::default(), now).unwrap();
+        assert_eq!(summary.status, AgentStatusKind::Waiting);
+    }
+
+    #[test]
+    fn thread_index_names_win() {
+        let mut cache = RefreshCache::default();
+        let files = vec![
+            CodexFile {
+                kind: CodexFileKind::Index,
+                modified_at: 0,
+                path: PathBuf::from("/tmp/index.jsonl"),
+                content: "{\"id\":\"aaaa-bbbb-cccc-dddd-eeee\",\"thread_name\":\"Fix auth\"}\n".into(),
+            },
+            CodexFile {
+                kind: CodexFileKind::Transcript,
+                modified_at: 12,
+                path: PathBuf::from(
+                    "/tmp/sessions/2026/04/01/rollout-2026-04-01T10-00-00-aaaa-bbbb-cccc-dddd-eeee.jsonl",
+                ),
+                content: format!(
+                    "{}\n{}\n",
+                    json!({ "type": "session_meta", "payload": { "cwd": "/tmp/project" } }),
+                    json!({ "type": "event_msg", "payload": { "type": "task_started" } })
+                ),
+            },
+        ];
+
+        let snapshot = collect_status_snapshot(
+            &[PaneTarget {
+                pane_id: "7".into(),
+                cwd: PathBuf::from("/tmp/project"),
+            }],
+            &files,
+            &mut cache,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(12),
+        );
+
+        assert_eq!(
+            snapshot
+                .panes
+                .get("7")
+                .and_then(|entry| entry.thread_name.as_deref()),
+            Some("Fix auth")
+        );
+    }
+
+    #[test]
+    fn newer_match_replaces_old_binding() {
+        let mut cache = RefreshCache::default();
+        cache.bindings.insert(
+            "7".into(),
+            CachedPaneBinding {
+                pane_id: "7".into(),
+                cwd: "/tmp/project".into(),
+                transcript_path: "/tmp/old.jsonl".into(),
+            },
+        );
+        let files = vec![
+            transcript("/tmp/old.jsonl", "/tmp/project", AgentStatusKind::Done, 5),
+            transcript(
+                "/tmp/new.jsonl",
+                "/tmp/project",
+                AgentStatusKind::Running,
+                9,
+            ),
+        ];
+
+        let snapshot = collect_status_snapshot(
+            &[PaneTarget {
+                pane_id: "7".into(),
+                cwd: PathBuf::from("/tmp/project"),
+            }],
+            &files,
+            &mut cache,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(9),
+        );
+
+        assert_eq!(
+            snapshot.panes.get("7").map(|entry| entry.updated_at),
+            Some(9)
+        );
+        assert_eq!(
+            cache
+                .bindings
+                .get("7")
+                .map(|binding| binding.transcript_path.as_str()),
+            Some("/tmp/new.jsonl")
+        );
     }
 
     #[test]
@@ -1017,34 +700,45 @@ mod tests {
     }
 
     #[test]
-    fn stale_binding_drops_after_pane_leaves_bound_cwd() {
-        let binding = CachedPaneBinding {
-            pane_id: "7".into(),
-            pid: 123,
-            cwd: "/tmp/project".into(),
-            transcript_path: "/tmp/project/transcript.jsonl".into(),
-            last_seen_at: 1,
-        };
-        let pane = PaneProbe {
-            pane_id: "7".into(),
-            pid: 123,
-            cwd: normalize_path(Path::new("/tmp/elsewhere")),
-            codex_pids: Vec::new(),
-            binding: Some(binding.clone()),
-        };
-        assert!(!binding_matches_pane(&binding, &pane));
+    fn normalize_path_stays_lexical() {
+        assert_eq!(
+            normalize_path(Path::new("/tmp/project/../other")),
+            PathBuf::from("/tmp/other")
+        );
     }
 
-    #[test]
-    fn cached_binding_shape_stays_serializable() {
-        let binding = CachedPaneBinding {
-            pane_id: "7".into(),
-            pid: 123,
-            cwd: normalize_path(Path::new("/tmp/project")).to_string_lossy().into_owned(),
-            transcript_path: "/tmp/project/transcript.jsonl".into(),
-            last_seen_at: 1,
+    fn transcript(path: &str, cwd: &str, status: AgentStatusKind, modified_at: u64) -> CodexFile {
+        let status_line = match status {
+            AgentStatusKind::Running => {
+                json!({ "type": "event_msg", "payload": { "type": "task_started" } })
+            }
+            AgentStatusKind::Done => {
+                json!({ "type": "event_msg", "payload": { "type": "task_complete" } })
+            }
+            AgentStatusKind::Waiting => {
+                json!({ "type": "response_item", "payload": { "type": "function_call" } })
+            }
+            AgentStatusKind::Idle => json!({}),
         };
-        let json = serde_json::to_string(&binding).unwrap();
-        assert!(json.contains("\"pane_id\":\"7\""));
+
+        CodexFile {
+            kind: CodexFileKind::Transcript,
+            modified_at,
+            path: PathBuf::from(path),
+            content: format!(
+                "{}\n{}\n",
+                json!({ "type": "session_meta", "payload": { "cwd": cwd } }),
+                status_line
+            ),
+        }
+    }
+
+    fn thread(path: &str, cwd: &str, status: AgentStatusKind, modified_at: u64) -> ThreadSummary {
+        summarize_thread(
+            &transcript(path, cwd, status, modified_at),
+            &Default::default(),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap()
     }
 }

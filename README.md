@@ -15,8 +15,7 @@ Dev loop:
 
 ```sh
 nix develop -c cargo build --target wasm32-wasip1 --bin zeldex
-nix develop -c cargo build --target aarch64-apple-darwin --features native --bin zeldex-status
-nix develop -c cargo test --features native
+nix develop -c cargo test
 ```
 
 Usage:
@@ -27,7 +26,6 @@ Usage:
 pane size=24 borderless=true {
     plugin location="file:/absolute/path/to/target/wasm32-wasip1/debug/zeldex.wasm" {
         poll_secs "1.2"
-        status_cmd "/absolute/path/to/target/aarch64-apple-darwin/debug/zeldex-status"
     }
 }
 ```
@@ -35,8 +33,7 @@ pane size=24 borderless=true {
 Notes:
 
 - built against Zellij `0.44.0`
-- plugin gets pane pid via Zellij plugin API, then runs one-shot `zeldex-status` refreshes on its timer
-- `zeldex-status` only tracks panes with a live Codex descendant process or a cached Codex binding from earlier polls
-- live Codex panes prefer exact transcript files discovered from descendant processes; cwd matching is only a fallback after a pane is known to be Codex-backed
+- plugin gets pane cwd via Zellij plugin API, then runs one host refresh command on its timer to read recent Codex transcripts
+- pane/thread matching is cwd + recency based; active bindings stay sticky until a newer matching transcript wins
 - `waiting` is heuristic: last meaningful transcript entry was a tool call and the file has been quiet for at least 3s
-- thread metadata is cached on disk, so long-lived `waiting` / `done` panes keep their status without rescanning full history every poll
+- status comes from recent Codex transcripts under `~/.codex/sessions`; very old inactive threads age out with the transcript scan window
