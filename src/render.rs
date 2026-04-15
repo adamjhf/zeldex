@@ -98,6 +98,36 @@ pub fn render_sidebar(
     clickable_rows
 }
 
+pub fn render_notice(
+    rows: usize,
+    cols: usize,
+    mode_info: &ModeInfo,
+    lines: &[String],
+) -> Vec<Option<usize>> {
+    let mut clickable_rows = Vec::new();
+    let header = fill_to_width(
+        &format!(
+            " {} ",
+            mode_info.session_name.as_deref().unwrap_or("zeldex")
+        ),
+        cols,
+    );
+    println!("{header}");
+    clickable_rows.push(None);
+
+    for line in lines.iter().take(rows.saturating_sub(1)) {
+        println!("{}", fill_to_width(&format!(" {line}"), cols));
+        clickable_rows.push(None);
+    }
+
+    for _ in clickable_rows.len()..rows {
+        println!("{}", " ".repeat(cols));
+        clickable_rows.push(None);
+    }
+
+    clickable_rows
+}
+
 fn paint(text: String, fg: PaletteColor, bg: PaletteColor, bold: bool) -> String {
     let mut style = Style::new().fg(to_colour(fg)).on(to_colour(bg));
     if bold {
@@ -130,4 +160,10 @@ fn truncate_to_width(input: &str, width: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn fill_to_width(input: &str, width: usize) -> String {
+    let truncated = truncate_to_width(input, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(truncated.as_str()));
+    format!("{truncated}{}", " ".repeat(padding))
 }

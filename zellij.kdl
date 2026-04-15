@@ -2,6 +2,7 @@ layout {
     tab name="dev" split_direction="vertical" {
         pane size=24 borderless=true {
             plugin location="file:target/wasm32-wasip1/debug/zeldex.wasm" {
+                codex_home "/Users/adam/.codex"
                 poll_secs "1.2"
             }
         }

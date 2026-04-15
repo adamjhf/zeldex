@@ -1,29 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::time::SystemTime;
-use zeldex::codex::{collect_status_snapshot, parse_refresh_output, PaneTarget, RefreshCache};
-use zeldex::render::{render_sidebar, TabLine};
+use std::path::{Path, PathBuf};
+
+use zeldex::codex::{collect_status_snapshot, PaneTarget, RefreshCache};
+use zeldex::codex_fs::load_recent_codex_files;
+use zeldex::render::{render_notice, render_sidebar, TabLine};
 use zeldex::status::AgentStatusKind;
 use zeldex::status_file::StatusSnapshot;
 use zellij_tile::prelude::*;
 
 const DEFAULT_POLL_SECS: f64 = 1.2;
-const STATUS_REFRESH_SCRIPT: &str = r#"code_home="${CODEX_HOME:-$HOME/.codex}"
-index="$code_home/session_index.jsonl"
-if [ -f "$index" ]; then
-  printf '\036index\t0\t%s\n' "$index"
-  cat "$index"
-  printf '\n'
-fi
-sessions="$code_home/sessions"
-if [ -d "$sessions" ]; then
-  find "$sessions" -type f -name '*.jsonl' -mtime -3 | sort | while IFS= read -r path; do
-    modified_at="$(stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || printf '0')"
-    printf '\036transcript\t%s\t%s\n' "$modified_at" "$path"
-    cat "$path"
-    printf '\n'
-  done
-fi"#;
+const INITIAL_POLL_SECS: f64 = 0.1;
+const HOST_CODEX_ROOT: &str = "/host";
 
 #[derive(Clone, Debug)]
 struct TrackedPane {
@@ -42,37 +29,52 @@ struct State {
     poll_secs: f64,
     snapshot: StatusSnapshot,
     refresh_cache: RefreshCache,
-    refresh_targets: Vec<PaneTarget>,
-    refresh_nonce: u64,
-    refresh_in_flight: bool,
-    permissions_granted: bool,
+    permission_state: PermissionState,
+    codex_home: Option<PathBuf>,
+    status_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PermissionState {
+    #[default]
+    Pending,
+    Granted,
+    Denied,
 }
 
 register_plugin!(State);
 
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
-        set_selectable(false);
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-        ]);
+        set_selectable(true);
+        self.poll_secs = configuration
+            .get("poll_secs")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .unwrap_or(DEFAULT_POLL_SECS);
+        self.codex_home = configuration
+            .get("codex_home")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        if self.codex_home.is_none() {
+            self.status_error = Some("missing codex_home config".to_owned());
+        }
+
         subscribe(&[
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
             EventType::Mouse,
             EventType::Timer,
-            EventType::RunCommandResult,
             EventType::PermissionRequestResult,
+            EventType::FailedToChangeHostFolder,
         ]);
-
-        self.poll_secs = configuration
-            .get("poll_secs")
-            .and_then(|value| value.parse::<f64>().ok())
-            .filter(|value| *value > 0.0)
-            .unwrap_or(DEFAULT_POLL_SECS);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::FullHdAccess,
+        ]);
+        set_timeout(INITIAL_POLL_SECS);
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -82,14 +84,22 @@ impl ZellijPlugin for State {
                 true
             }
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
-                self.permissions_granted = true;
-                self.start_status_refresh();
+                self.permission_state = PermissionState::Granted;
+                set_selectable(false);
+                self.configure_codex_host();
+                let changed = self.refresh_from_host();
+                set_timeout(self.poll_secs);
+                changed || self.should_render_notice()
+            }
+            Event::PermissionRequestResult(PermissionStatus::Denied) => {
+                self.permission_state = PermissionState::Denied;
+                set_selectable(true);
                 set_timeout(self.poll_secs);
                 true
             }
-            Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                self.permissions_granted = false;
-                set_timeout(self.poll_secs);
+            Event::FailedToChangeHostFolder(error) => {
+                self.status_error =
+                    Some(error.unwrap_or_else(|| "failed to point /host at codex home".to_owned()));
                 true
             }
             Event::TabUpdate(tabs) => {
@@ -99,25 +109,26 @@ impl ZellijPlugin for State {
             }
             Event::PaneUpdate(pane_manifest) => {
                 self.panes_by_tab = pane_manifest.panes.into_iter().collect();
+                let changed = self.refresh_from_host();
                 self.reconcile_tracked_panes();
-                self.start_status_refresh();
-                true
-            }
-            Event::RunCommandResult(exit_code, stdout, _stderr, context) => {
-                self.handle_status_refresh(exit_code, stdout, context)
+                changed
             }
             Event::Mouse(mouse) => self.handle_mouse(mouse),
             Event::Timer(_) => {
-                self.start_status_refresh();
+                let changed = self.refresh_from_host();
                 set_timeout(self.poll_secs);
-                false
+                changed || self.should_render_notice()
             }
             _ => false,
         }
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
-        if rows == 0 || cols == 0 || self.tabs.is_empty() {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        if self.should_render_notice() || self.tabs.is_empty() {
+            self.clickable_rows = render_notice(rows, cols, &self.mode_info, &self.notice_lines());
             return;
         }
 
@@ -201,61 +212,65 @@ impl State {
         changed
     }
 
-    fn start_status_refresh(&mut self) {
-        if !self.permissions_granted || self.refresh_in_flight {
+    fn configure_codex_host(&mut self) {
+        let Some(codex_home) = self.codex_home.clone() else {
             return;
+        };
+        self.status_error = None;
+        change_host_folder(codex_home);
+    }
+
+    fn refresh_from_host(&mut self) -> bool {
+        if self.permission_state != PermissionState::Granted {
+            return false;
         }
         let targets = self.visible_pane_targets();
         if targets.is_empty() {
-            self.refresh_targets.clear();
+            self.snapshot = StatusSnapshot::default();
             self.refresh_cache.bindings.clear();
-            return;
-        }
-
-        self.refresh_nonce += 1;
-        self.refresh_targets = targets;
-        self.refresh_in_flight = true;
-
-        let mut context = BTreeMap::new();
-        context.insert("kind".to_owned(), "status-refresh".to_owned());
-        context.insert("nonce".to_owned(), self.refresh_nonce.to_string());
-
-        run_command(&["/bin/sh", "-lc", STATUS_REFRESH_SCRIPT], context);
-    }
-
-    fn handle_status_refresh(
-        &mut self,
-        exit_code: Option<i32>,
-        stdout: Vec<u8>,
-        context: BTreeMap<String, String>,
-    ) -> bool {
-        if context.get("kind").map(String::as_str) != Some("status-refresh") {
-            return false;
-        }
-        let nonce = context
-            .get("nonce")
-            .and_then(|nonce| nonce.parse::<u64>().ok());
-        if nonce != Some(self.refresh_nonce) {
+            self.tracked_panes.clear();
             return false;
         }
 
-        self.refresh_in_flight = false;
-        if exit_code != Some(0) {
-            return false;
-        }
-
-        parse_refresh_output(&stdout)
-            .ok()
-            .map(|files| {
+        match load_recent_codex_files(Path::new(HOST_CODEX_ROOT), std::time::SystemTime::now()) {
+            Ok(files) => {
+                self.status_error = None;
                 let snapshot = collect_status_snapshot(
-                    &self.refresh_targets,
+                    &targets,
                     &files,
                     &mut self.refresh_cache,
-                    SystemTime::now(),
+                    std::time::SystemTime::now(),
                 );
                 self.apply_snapshot(snapshot)
-            })
-            .unwrap_or(false)
+            }
+            Err(error) => {
+                let changed = self.status_error.as_deref() != Some(error.as_str());
+                self.status_error = Some(error);
+                changed
+            }
+        }
+    }
+
+    fn notice_lines(&self) -> Vec<String> {
+        if let Some(error) = &self.status_error {
+            return vec!["codex read failed".to_owned(), error.clone()];
+        }
+
+        match self.permission_state {
+            PermissionState::Pending => vec![
+                "waiting for plugin permissions".to_owned(),
+                "needs app-state + full disk access".to_owned(),
+            ],
+            PermissionState::Denied => vec![
+                "plugin permissions denied".to_owned(),
+                "grant access, then reopen zellij".to_owned(),
+            ],
+            PermissionState::Granted => vec!["waiting for tab data".to_owned()],
+        }
+    }
+
+    fn should_render_notice(&self) -> bool {
+        self.permission_state != PermissionState::Granted || self.status_error.is_some()
     }
 
     fn reconcile_tracked_panes(&mut self) {
