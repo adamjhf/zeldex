@@ -137,11 +137,7 @@ impl ZellijPlugin for State {
             .iter()
             .map(|tab| TabLine {
                 position: tab.position,
-                name: if tab.name.is_empty() {
-                    format!("tab-{}", tab.position + 1)
-                } else {
-                    tab.name.clone()
-                },
+                name: self.tab_name(tab),
                 active: tab.active,
                 unread: self.unread_tabs.contains(&tab.position),
                 tracked_agents: self.agent_count_for_tab(tab.position),
@@ -326,6 +322,27 @@ impl State {
         }
     }
 
+    fn tab_name(&self, tab: &TabInfo) -> String {
+        self.panes_by_tab
+            .get(&tab.position)
+            .and_then(|panes| {
+                panes
+                    .iter()
+                    .filter(|pane| !pane.is_plugin)
+                    .find(|pane| pane.is_focused)
+                    .or_else(|| panes.iter().find(|pane| !pane.is_plugin))
+            })
+            .and_then(|pane| get_pane_cwd(PaneId::Terminal(pane.id)).ok())
+            .and_then(|cwd| folder_name(&normalize_cwd(cwd)))
+            .unwrap_or_else(|| {
+                if tab.name.is_empty() {
+                    format!("tab-{}", tab.position + 1)
+                } else {
+                    tab.name.clone()
+                }
+            })
+    }
+
     fn active_tab_position(&self) -> Option<usize> {
         self.tabs
             .iter()
@@ -364,6 +381,21 @@ fn normalize_cwd(path: PathBuf) -> PathBuf {
     normalized
 }
 
+fn folder_name(path: &Path) -> Option<String> {
+    path.file_name()
+        .or_else(|| {
+            path.components().next_back().and_then(|component| {
+                let text = component.as_os_str().to_string_lossy();
+                if text.is_empty() || text == std::path::MAIN_SEPARATOR_STR {
+                    None
+                } else {
+                    Some(component.as_os_str())
+                }
+            })
+        })
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
 fn tracked_pane_set_changed(
     previous: &HashMap<PaneId, AgentStatusKind>,
     current: &HashMap<PaneId, TrackedPane>,
@@ -376,8 +408,9 @@ fn tracked_pane_set_changed(
 
 #[cfg(test)]
 mod tests {
-    use super::{tracked_pane_set_changed, TrackedPane};
+    use super::{folder_name, tracked_pane_set_changed, TrackedPane};
     use std::collections::HashMap;
+    use std::path::Path;
     use zeldex::status::AgentStatusKind;
     use zellij_tile::prelude::PaneId;
 
@@ -401,5 +434,14 @@ mod tests {
             },
         )]);
         assert!(!tracked_pane_set_changed(&previous, &current));
+    }
+
+    #[test]
+    fn folder_name_uses_final_path_component() {
+        assert_eq!(
+            folder_name(Path::new("/Users/adam/Projects/dotnix")),
+            Some("dotnix".into())
+        );
+        assert_eq!(folder_name(Path::new("/")), None);
     }
 }

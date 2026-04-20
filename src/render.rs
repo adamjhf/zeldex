@@ -21,21 +21,19 @@ pub fn render_sidebar(
     tabs: &[TabLine],
 ) -> Vec<Option<usize>> {
     let palette = mode_info.style.colors;
-    let base_bg = palette.text_unselected.background;
-    let base_fg = palette.text_unselected.base;
     let active_bg = palette.ribbon_selected.background;
     let active_fg = palette.ribbon_selected.base;
     let accent = palette.ribbon_unselected.emphasis_3;
 
     let mut clickable_rows = Vec::new();
-    let header = format!(
-        " {} ",
-        mode_info.session_name.as_deref().unwrap_or("zeldex")
+    let header = fill_to_width(
+        &format!(
+            " {} ",
+            mode_info.session_name.as_deref().unwrap_or("zeldex")
+        ),
+        cols,
     );
-    println!(
-        "{}",
-        paint(truncate_to_width(&header, cols), base_fg, base_bg, true,)
-    );
+    println!("{header}");
     clickable_rows.push(None);
 
     for tab in tabs.iter().take(rows.saturating_sub(1)) {
@@ -45,18 +43,12 @@ pub fn render_sidebar(
             tab.status
         };
         let badge = if tab.unread { "●" } else { status.badge() };
-        let label = if cols >= 18 { status.label() } else { "" };
-        let count = if tab.tracked_agents > 1 {
-            format!(" {}", tab.tracked_agents)
+        let suffix = if tab.tracked_agents > 1 {
+            format!("{badge} {}", tab.tracked_agents)
         } else {
-            String::new()
+            format!("{badge} ")
         };
         let prefix = if tab.active { "▌" } else { " " };
-        let suffix = if label.is_empty() {
-            format!("{badge}{count}")
-        } else {
-            format!("{badge}{count} {label}")
-        };
         let index = tab.position + 1;
         let chrome_width = UnicodeWidthStr::width(prefix)
             + 1
@@ -76,13 +68,10 @@ pub fn render_sidebar(
                 + UnicodeWidthStr::width(suffix.as_str()),
         ));
         let line = format!("{prefix} {index} {name}{padding} {suffix}");
-        let (fg, bg, bold) = if tab.active {
-            (active_fg, active_bg, true)
-        } else {
-            (base_fg, base_bg, false)
-        };
-        let rendered = paint(truncate_to_width(&line, cols), fg, bg, bold);
-        if tab.unread || matches!(status, AgentStatusKind::Waiting) {
+        let rendered = truncate_to_width(&line, cols);
+        if tab.active {
+            println!("{}", paint(rendered, active_fg, Some(active_bg), true));
+        } else if tab.unread || matches!(status, AgentStatusKind::Waiting) {
             println!("{}", paint_badge(rendered, accent));
         } else {
             println!("{rendered}");
@@ -91,7 +80,7 @@ pub fn render_sidebar(
     }
 
     for _ in clickable_rows.len()..rows {
-        println!("{}", paint(" ".repeat(cols), base_fg, base_bg, false));
+        println!("{}", " ".repeat(cols));
         clickable_rows.push(None);
     }
 
@@ -128,8 +117,11 @@ pub fn render_notice(
     clickable_rows
 }
 
-fn paint(text: String, fg: PaletteColor, bg: PaletteColor, bold: bool) -> String {
-    let mut style = Style::new().fg(to_colour(fg)).on(to_colour(bg));
+fn paint(text: String, fg: PaletteColor, bg: Option<PaletteColor>, bold: bool) -> String {
+    let mut style = Style::new().fg(to_colour(fg));
+    if let Some(bg) = bg {
+        style = style.on(to_colour(bg));
+    }
     if bold {
         style = style.bold();
     }
